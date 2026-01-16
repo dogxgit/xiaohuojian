@@ -1,0 +1,44 @@
+name: Sync lazy_group.conf
+
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch and modify lazy_group.conf
+        run: |
+          # Fetch the original file
+          curl -fsSL "https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/refs/heads/main/lazy_group.conf" -o lazy_group.conf
+
+          # Modify Singapore node filter to only match SG1-ALIYUN-XRAY
+          sed -i 's/新加坡节点 = url-test,url=http:\/\/www.gstatic.com\/generate_204,interval=600,tolerance=0,timeout=5,select=0,policy-regex-filter=🇸🇬|SG|Sing|sing|新加坡|狮城|沪新|京新|深新|杭新|广新/新加坡节点 = url-test,url=http:\/\/www.gstatic.com\/generate_204,interval=600,tolerance=0,timeout=5,select=0,policy-regex-filter=SG1-ALIYUN-XRAY/' lazy_group.conf
+
+          # Modify AI policy to default select Singapore node
+          sed -i 's/AI = select,PROXY,香港节点,台湾节点,日本节点,新加坡节点,韩国节点,美国节点,policy-select-name=PROXY/AI = select,PROXY,香港节点,台湾节点,日本节点,新加坡节点,韩国节点,美国节点,policy-select-name=新加坡节点/' lazy_group.conf
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet lazy_group.conf 2>/dev/null; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add lazy_group.conf
+          git commit -m "Sync lazy_group.conf from upstream $(date +'%Y-%m-%d')"
+          git push
