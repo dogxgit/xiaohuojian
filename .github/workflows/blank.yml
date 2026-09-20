@@ -1,47 +1,111 @@
-name: Sync lazy_group.conf
+name: Sync Shadowrocket configuration
 
 on:
   schedule:
-    # Run daily at 00:00 UTC
-    - cron: '0 0 * * *'
-  workflow_dispatch: # Allow manual trigger
+    # 每天北京时间 / 香港时间 08:23（UTC 00:23）。
+    - cron: '23 0 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: sync-shadowrocket
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      SOURCE_URL: https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/main/lazy_group.conf
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout default branch
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
-      - name: Fetch and modify lazy_group.conf
+      - name: Download and customize configuration
+        id: config
+        shell: bash
         run: |
-          # Fetch the original file
-          curl -fsSL "https://raw.githubusercontent.com/LOWERTOP/Shadowrocket/refs/heads/main/lazy_group.conf" -o lazy_group.conf
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 15 --max-time 60 \
+            "$SOURCE_URL" -o "$RUNNER_TEMP/lazy_group.upstream.conf"
 
-          # Modify Singapore node filter to only match SG1-ALIYUN-XRAY
-          sed -i 's/新加坡节点 = url-test,url=http:\/\/www.gstatic.com\/generate_204,interval=600,tolerance=0,timeout=5,select=0,policy-regex-filter=🇸🇬|SG|Sing|sing|新加坡|狮城|沪新|京新|深新|杭新|广新/新加坡节点 = url-test,url=http:\/\/www.gstatic.com\/generate_204,interval=600,tolerance=0,timeout=5,select=0,policy-regex-filter=SG1-ALIYUN-XRAY/' lazy_group.conf
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
 
-          # Modify AI policy to default select Singapore node
-          sed -i 's/AI = select,PROXY,香港节点,台湾节点,日本节点,新加坡节点,韩国节点,美国节点,policy-select-name=PROXY/AI = select,PROXY,香港节点,台湾节点,日本节点,新加坡节点,韩国节点,美国节点,policy-select-name=新加坡节点/' lazy_group.conf
+          source = Path(os.environ['RUNNER_TEMP']) / 'lazy_group.upstream.conf'
+          text = source.read_text(encoding='utf-8-sig')
+          lines = text.splitlines()
+          for section in ('General', 'Proxy Group', 'Rule'):
+              if sum(line.strip() == f'[{section}]' for line in lines) != 1:
+                  raise SystemExit(f'Invalid upstream configuration: [{section}]')
+          if not any(re.match(r'^FINAL\s*,', line.strip(), re.I) for line in lines):
+              raise SystemExit('Invalid upstream configuration: missing FINAL rule')
 
-      - name: Check for changes
-        id: check_changes
+          overrides = [
+              '# 自定义规则：推送通知',
+              'DOMAIN-SUFFIX,push.apple.com,PROXY',
+              '# 自定义规则：APNs 证书请求门户',
+              'DOMAIN,identity.apple.com,PROXY',
+              '',
+          ]
+          targets = {
+              ('DOMAIN-SUFFIX', 'push.apple.com'),
+              ('DOMAIN', 'identity.apple.com'),
+          }
+          result = []
+          in_rules = False
+          for line in lines:
+              stripped = line.strip()
+              if stripped.startswith('[') and stripped.endswith(']'):
+                  in_rules = stripped == '[Rule]'
+                  result.append(line)
+                  if in_rules:
+                      result.extend(overrides)
+                  continue
+              if in_rules and not stripped.startswith('#'):
+                  fields = [part.strip() for part in stripped.split(',')]
+                  if len(fields) >= 2 and (fields[0].upper(), fields[1].lower()) in targets:
+                      continue
+              result.append(line)
+
+          # 校验及处理全部成功后才写入目标，避免错误响应覆盖原配置。
+          Path('lazy_group.conf').write_text('\n'.join(result) + '\n', encoding='utf-8')
+          PY
+
+      - name: Commit configuration and monthly activity record
+        # 下载失败时仍保留每月提交能力；原下载步骤的失败状态不会被隐藏。
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        env:
+          CONFIG_OUTCOME: ${{ steps.config.outcome }}
+        shell: bash
         run: |
-          if git diff --quiet lazy_group.conf 2>/dev/null; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # 每月产生一次真实文件变更，不依赖上游更新或下载成功。
+          mkdir -p .github/sync-state
+          date -u +'%Y-%m' > .github/sync-state/shadowrocket-month.txt
+          git add -- .github/sync-state/shadowrocket-month.txt
+          if [ "$CONFIG_OUTCOME" = 'success' ]; then
+            git add -- lazy_group.conf
           fi
 
-      - name: Commit and push changes
-        if: steps.check_changes.outputs.changed == 'true'
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add lazy_group.conf
-          git commit -m "Sync lazy_group.conf from upstream $(date +'%Y-%m-%d')"
-          git push
+          if git diff --cached --quiet; then
+            echo 'Configuration unchanged; monthly activity already recorded.'
+            exit 0
+          fi
+
+          git commit -m 'chore: sync Shadowrocket configuration and activity record'
+          git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
